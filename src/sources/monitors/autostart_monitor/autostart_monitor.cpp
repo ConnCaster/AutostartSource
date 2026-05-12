@@ -35,7 +35,8 @@ constexpr uint64_t kAutostartActionMask =
 
 constexpr uint64_t kAutostartMarkMask =
     kAutostartActionMask |
-    FAN_EVENT_ON_CHILD;
+   FAN_EVENT_ON_CHILD |
+   FAN_ONDIR;
 
 bool IsInterestingChange(uint64_t mask) {
     return (mask & kAutostartActionMask) != 0;
@@ -525,10 +526,20 @@ void AutostartMonitor::PollOnce(
                      * Саму директорию как событие автозапуска не отправляем.
                      */
                     if ((metadata->mask & FAN_ONDIR) != 0) {
-                        if (IsDirectChildOfSystemdRoot(path.value()) &&
-                            IsSystemdDependencyDir(path.value())) {
+                        std::cout << "autostart directory event: mask=0x"
+                                  << std::hex << metadata->mask
+                                  << std::dec
+                                  << " path=" << *path
+                                  << std::endl;
+
+                        if (IsDirectChildOfSystemdRoot(*path) &&
+                            IsSystemdDependencyDir(*path)) {
+                            std::cout << "autostart dependency dir changed, refreshing watches: "
+                                      << *path
+                                      << std::endl;
+
                             RefreshWatches();
-                        }
+                            }
 
                         info_ptr += hdr->len;
                         continue;
