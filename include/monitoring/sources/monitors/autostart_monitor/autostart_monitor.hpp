@@ -19,12 +19,12 @@ constexpr const char* kSystemdDependencyRequires = "/etc/systemd/system/*.requir
 
 struct AutostartMonitorConfig {
     std::vector<std::string> base_dirs{
-        // kDefaultAutostartRoot
+        kDefaultAutostartRoot
     };
 
     std::vector<std::string> dependency_dir_suffixes{
-        // kDefaultWantsSuffix,
-        // kDefaultRequiresSuffix
+        kDefaultWantsSuffix,
+        kDefaultRequiresSuffix
     };
 };
 
