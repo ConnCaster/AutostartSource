@@ -11,6 +11,12 @@ namespace monitoring {
     class AutostartSource : public ThreadedSource {
     public:
         explicit AutostartSource(std::shared_ptr<IEventQueue> queue);
+
+        AutostartSource(
+            std::shared_ptr<IEventQueue> queue,
+            AutostartMonitorConfig config
+        );
+
         ~AutostartSource() override;
 
     protected:

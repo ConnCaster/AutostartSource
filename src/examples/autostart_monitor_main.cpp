@@ -19,7 +19,21 @@ int main() {
     std::signal(SIGTERM, OnSignal);
 
     auto queue = std::make_shared<monitoring::EventQueue>(4096);
-    monitoring::AutostartSource source(queue);
+    monitoring::AutostartMonitorConfig config;
+
+    config.base_dirs = {
+        "/etc/systemd/system",
+        // "/usr/lib/systemd/system",
+        // "/lib/systemd/system"
+    };
+
+    config.dependency_dir_suffixes = {
+        ".wants",
+        ".requires",
+        ".custom-wants",
+        ".custom-requires"
+    };
+    monitoring::AutostartSource source(queue, std::move(config));
 
     const int rc = source.Start();
     if (rc != 0) {

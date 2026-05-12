@@ -8,7 +8,6 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
-#include <glob.h>
 #include <iostream>
 #include <poll.h>
 #include <sstream>
@@ -19,13 +18,9 @@
 namespace monitoring {
 namespace {
 
-constexpr std::size_t kBufSize = 16384;
-constexpr const char* kAutostartSystemdRoot = "/etc/systemd/system";
-constexpr const char* kSystemdSuffixWants = ".wants";
-constexpr const char* kSystemdSuffixRequires = ".requires";
-constexpr const char* kSystemdDependencyWants = "/etc/systemd/system/*.wants";
-constexpr const char* kSystemdDependencyRequires = "/etc/systemd/system/*.requires";
+namespace fs = std::filesystem;
 
+constexpr std::size_t kBufSize = 16384;
 
 constexpr uint64_t kAutostartActionMask =
     FAN_CREATE |
@@ -46,20 +41,65 @@ bool HasSuffix(const std::string& value, const std::string& suffix) {
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-bool IsSystemdDependencyDir(const std::string& path) {
-    return HasSuffix(path, kSystemdSuffixWants) || HasSuffix(path, kSystemdSuffixRequires);
+std::string NormalizeDirPath(std::string path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    path = fs::path(path).lexically_normal().string();
+
+    while (path.size() > 1 && path.back() == '/') {
+        path.pop_back();
+    }
+
+    return path;
 }
 
-bool IsUsableName(const std::string& name) {
-    return !name.empty() &&
-           name != "." &&
-           name != ".." &&
-           name.find('/') == std::string::npos;
-}
+void NormalizeConfig(AutostartMonitorConfig& config) {
+    for (auto& path : config.base_dirs) {
+        path = NormalizeDirPath(std::move(path));
+    }
 
-bool IsDirectory(const std::string& path) {
-    std::error_code ec;
-    return std::filesystem::is_directory(path, ec);
+    config.base_dirs.erase(
+        std::remove_if(
+            config.base_dirs.begin(),
+            config.base_dirs.end(),
+            [](const std::string& path) {
+                return path.empty();
+            }
+        ),
+        config.base_dirs.end()
+    );
+
+    std::sort(config.base_dirs.begin(), config.base_dirs.end());
+    config.base_dirs.erase(
+        std::unique(config.base_dirs.begin(), config.base_dirs.end()),
+        config.base_dirs.end()
+    );
+
+    config.dependency_dir_suffixes.erase(
+        std::remove_if(
+            config.dependency_dir_suffixes.begin(),
+            config.dependency_dir_suffixes.end(),
+            [](const std::string& suffix) {
+                return suffix.empty();
+            }
+        ),
+        config.dependency_dir_suffixes.end()
+    );
+
+    std::sort(
+        config.dependency_dir_suffixes.begin(),
+        config.dependency_dir_suffixes.end()
+    );
+
+    config.dependency_dir_suffixes.erase(
+        std::unique(
+            config.dependency_dir_suffixes.begin(),
+            config.dependency_dir_suffixes.end()
+        ),
+        config.dependency_dir_suffixes.end()
+    );
 }
 
 bool IsUnderRoot(const std::string& path, const std::string& root) {
@@ -67,8 +107,7 @@ bool IsUnderRoot(const std::string& path, const std::string& root) {
            path.rfind(root + "/", 0) == 0;
 }
 
-bool IsDirectChildOfSystemdRoot(const std::string& path) {
-    const std::string root{kAutostartSystemdRoot};
+bool IsDirectChildOfRoot(const std::string& path, const std::string& root) {
     const std::string prefix = root + "/";
 
     if (path.rfind(prefix, 0) != 0) {
@@ -76,7 +115,15 @@ bool IsDirectChildOfSystemdRoot(const std::string& path) {
     }
 
     const std::string tail = path.substr(prefix.size());
+
     return !tail.empty() && tail.find('/') == std::string::npos;
+}
+
+bool IsUsableName(const std::string& name) {
+    return !name.empty() &&
+           name != "." &&
+           name != ".." &&
+           name.find('/') == std::string::npos;
 }
 
 std::optional<std::string> ReadFdPath(int fd) {
@@ -140,30 +187,59 @@ EventType GetAutostartEventType(uint64_t mask) {
     return EventType::Unknown;
 }
 
-void AddGlobMatches(std::vector<std::string>& result, const char* pattern) {
-    glob_t glob_result {};
-    const int rc = glob(pattern, 0, nullptr, &glob_result);
-
-    if (rc == 0) {
-        for (std::size_t i = 0; i < glob_result.gl_pathc; ++i) {
-            std::string path = glob_result.gl_pathv[i];
-
-            if (IsDirectory(path) && IsSystemdDependencyDir(path)) {
-                result.push_back(std::move(path));
-            }
-        }
-    } else if (rc != GLOB_NOMATCH) {
-        std::cerr << "glob(" << pattern << ") failed, rc=" << rc << std::endl;
-    }
-
-    globfree(&glob_result);
-}
-
-std::vector<std::string> CollectSystemdDependencyDirs() {
+std::vector<std::string> CollectDependencyDirs(
+    const AutostartMonitorConfig& config
+) {
     std::vector<std::string> result;
 
-    AddGlobMatches(result, kSystemdDependencyWants);
-    AddGlobMatches(result, kSystemdDependencyRequires);
+    for (const auto& base_dir : config.base_dirs) {
+        std::error_code ec;
+
+        fs::directory_iterator it(
+            base_dir,
+            fs::directory_options::skip_permission_denied,
+            ec
+        );
+
+        if (ec) {
+            std::cerr << "directory_iterator(" << base_dir << ") failed: "
+                      << ec.message()
+                      << std::endl;
+            continue;
+        }
+
+        const fs::directory_iterator end;
+
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                std::cerr << "directory_iterator increment failed: "
+                          << ec.message()
+                          << std::endl;
+                ec.clear();
+                continue;
+            }
+
+            std::error_code entry_ec;
+
+            if (!it->is_directory(entry_ec)) {
+                continue;
+            }
+
+            const std::string path = it->path().string();
+
+            const bool suffix_matches = std::any_of(
+                config.dependency_dir_suffixes.begin(),
+                config.dependency_dir_suffixes.end(),
+                [&path](const std::string& suffix) {
+                    return HasSuffix(path, suffix);
+                }
+            );
+
+            if (suffix_matches) {
+                result.push_back(path);
+            }
+        }
+    }
 
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
@@ -172,6 +248,93 @@ std::vector<std::string> CollectSystemdDependencyDirs() {
 }
 
 }  // namespace
+
+AutostartMonitor::AutostartMonitor() {
+    NormalizeConfig(config_);
+}
+
+AutostartMonitor::AutostartMonitor(AutostartMonitorConfig config)
+    : config_(std::move(config)) {
+    NormalizeConfig(config_);
+}
+
+bool AutostartMonitor::SetConfig(AutostartMonitorConfig config) {
+    if (fan_fd_ >= 0) {
+        std::cerr << "AutostartMonitor::SetConfig() must be called before Init()"
+                  << std::endl;
+        return false;
+    }
+
+    NormalizeConfig(config);
+
+    if (config.base_dirs.empty()) {
+        std::cerr << "AutostartMonitor config has no base directories"
+                  << std::endl;
+        return false;
+    }
+
+    if (config.dependency_dir_suffixes.empty()) {
+        std::cerr << "AutostartMonitor config has no dependency suffixes"
+                  << std::endl;
+        return false;
+    }
+
+    config_ = std::move(config);
+    return true;
+}
+
+bool AutostartMonitor::AddBaseDirectory(std::string path) {
+    if (fan_fd_ >= 0) {
+        std::cerr << "AutostartMonitor::AddBaseDirectory() must be called before Init()"
+                  << std::endl;
+        return false;
+    }
+
+    path = NormalizeDirPath(std::move(path));
+
+    if (path.empty()) {
+        return false;
+    }
+
+    if (std::find(config_.base_dirs.begin(), config_.base_dirs.end(), path) !=
+        config_.base_dirs.end()) {
+        return true;
+    }
+
+    config_.base_dirs.push_back(std::move(path));
+    NormalizeConfig(config_);
+
+    return true;
+}
+
+bool AutostartMonitor::AddDependencyDirSuffix(std::string suffix) {
+    if (fan_fd_ >= 0) {
+        std::cerr << "AutostartMonitor::AddDependencyDirSuffix() must be called before Init()"
+                  << std::endl;
+        return false;
+    }
+
+    if (suffix.empty()) {
+        return false;
+    }
+
+    if (std::find(
+            config_.dependency_dir_suffixes.begin(),
+            config_.dependency_dir_suffixes.end(),
+            suffix
+        ) != config_.dependency_dir_suffixes.end()) {
+        return true;
+    }
+
+    config_.dependency_dir_suffixes.push_back(std::move(suffix));
+    NormalizeConfig(config_);
+
+    return true;
+}
+
+const AutostartMonitorConfig& AutostartMonitor::GetConfig() const {
+    return config_;
+}
 
 AutostartMonitor::~AutostartMonitor() {
     Shutdown();
@@ -183,9 +346,11 @@ void AutostartMonitor::Shutdown() {
         fan_fd_ = -1;
     }
 
-    if (systemd_root_fd_ >= 0) {
-        close(systemd_root_fd_);
-        systemd_root_fd_ = -1;
+    for (auto& root : base_roots_) {
+        if (root.fd >= 0) {
+            close(root.fd);
+            root.fd = -1;
+        }
     }
 
     for (auto& root : watched_roots_) {
@@ -195,11 +360,26 @@ void AutostartMonitor::Shutdown() {
         }
     }
 
+    base_roots_.clear();
     watched_roots_.clear();
 }
 
 int AutostartMonitor::Init() {
     Shutdown();
+
+    NormalizeConfig(config_);
+
+    if (config_.base_dirs.empty()) {
+        std::cerr << "AutostartMonitor: no base directories configured"
+                  << std::endl;
+        return EINVAL;
+    }
+
+    if (config_.dependency_dir_suffixes.empty()) {
+        std::cerr << "AutostartMonitor: no dependency suffixes configured"
+                  << std::endl;
+        return EINVAL;
+    }
 
     const unsigned int kInitFlags =
         FAN_CLASS_NOTIF |
@@ -217,44 +397,60 @@ int AutostartMonitor::Init() {
         return saved_errno;
     }
 
-    systemd_root_fd_ = open(
-        kAutostartSystemdRoot,
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC
-    );
+    for (const auto& base_dir : config_.base_dirs) {
+        const int rc = MarkBaseDirectory(base_dir);
 
-    if (systemd_root_fd_ < 0) {
+        if (rc != 0) {
+            Shutdown();
+            return rc;
+        }
+    }
+
+    const int rc = RefreshWatches();
+
+    if (rc != 0) {
+        Shutdown();
+    }
+
+    return rc;
+}
+
+int AutostartMonitor::MarkBaseDirectory(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (fd < 0) {
         const int saved_errno = errno;
-        std::cerr << "open(" << kAutostartSystemdRoot << ") failed: "
+        std::cerr << "open(" << path << ") failed: "
                   << std::strerror(saved_errno)
                   << std::endl;
-        Shutdown();
         return saved_errno;
     }
 
-    /*
-     * Маркируем сам /etc/systemd/system, чтобы заметить появление новых
-     * *.wants / *.requires директорий и добавить их в watched_roots_.
-     * События по обычным unit-файлам из /etc/systemd/system ниже не генерируются.
-     */
     if (fanotify_mark(
             fan_fd_,
             FAN_MARK_ADD | FAN_MARK_ONLYDIR,
             kAutostartMarkMask,
             AT_FDCWD,
-            kAutostartSystemdRoot
+            path.c_str()
         ) < 0) {
         const int saved_errno = errno;
 
-        std::cerr << "fanotify_mark(" << kAutostartSystemdRoot << ") failed: "
+        std::cerr << "fanotify_mark(" << path << ") failed: "
                   << std::strerror(saved_errno)
                   << " errno=" << saved_errno
                   << std::endl;
 
-        Shutdown();
+        close(fd);
         return saved_errno;
-    }
+        }
 
-    return RefreshWatches();
+    base_roots_.push_back({path, fd});
+
+    std::cout << "autostart base directory marked successfully: "
+              << path
+              << std::endl;
+
+    return 0;
 }
 
 int AutostartMonitor::MarkDependencyDirectory(const std::string& path) {
@@ -284,7 +480,7 @@ int AutostartMonitor::MarkDependencyDirectory(const std::string& path) {
 
         close(fd);
         return saved_errno;
-    }
+        }
 
     watched_roots_.push_back({path, fd});
 
@@ -305,7 +501,7 @@ int AutostartMonitor::RefreshWatches() {
 
     watched_roots_.clear();
 
-    const auto dirs = CollectSystemdDependencyDirs();
+    const auto dirs = CollectDependencyDirs(config_);
 
     int first_error = 0;
 
@@ -318,14 +514,36 @@ int AutostartMonitor::RefreshWatches() {
     }
 
     /*
-     * Не считаем отсутствие *.wants / *.requires фатальной ошибкой:
-     * /etc/systemd/system уже отмечен, и при появлении новой директории
-     * RefreshWatches() будет вызван снова.
+     * Отсутствие dependency-директорий не считаем ошибкой.
+     * Базовые директории уже промаркированы, поэтому при создании новой
+     * директории с нужным суффиксом монитор сможет вызвать RefreshWatches().
      */
     return first_error;
 }
 
-bool AutostartMonitor::IsUnderWatchedDependencyRoot(const std::string& path) const {
+bool AutostartMonitor::IsDependencyDirectory(const std::string& path) const {
+    return std::any_of(
+        config_.dependency_dir_suffixes.begin(),
+        config_.dependency_dir_suffixes.end(),
+        [&path](const std::string& suffix) {
+            return HasSuffix(path, suffix);
+        }
+    );
+}
+
+bool AutostartMonitor::IsDirectChildOfBaseRoot(const std::string& path) const {
+    for (const auto& base_dir : config_.base_dirs) {
+        if (IsDirectChildOfRoot(path, base_dir)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool AutostartMonitor::IsUnderWatchedDependencyRoot(
+        const std::string& path
+    ) const {
     for (const auto& root : watched_roots_) {
         if (IsUnderRoot(path, root.path) && path != root.path) {
             return true;
@@ -372,8 +590,10 @@ std::optional<std::string> AutostartMonitor::ResolvePathFromDfidName(
 
     std::vector<int> mount_fds;
 
-    if (systemd_root_fd_ >= 0) {
-        mount_fds.push_back(systemd_root_fd_);
+    for (const auto& root : base_roots_) {
+        if (root.fd >= 0) {
+            mount_fds.push_back(root.fd);
+        }
     }
 
     for (const auto& root : watched_roots_) {
@@ -525,10 +745,10 @@ void AutostartMonitor::PollOnce(
                      * Саму директорию как событие автозапуска не отправляем.
                      */
                     if ((metadata->mask & FAN_ONDIR) != 0) {
-                        if (IsDirectChildOfSystemdRoot(path.value()) &&
-                            IsSystemdDependencyDir(path.value())) {
+                        if (IsDirectChildOfBaseRoot(path.value()) &&
+                            IsDependencyDirectory(path.value())) {
                             RefreshWatches();
-                        }
+                            }
 
                         info_ptr += hdr->len;
                         continue;

@@ -19,6 +19,15 @@ namespace monitoring {
         std::cout << "AutostartSource: constructed\n";
     }
 
+    AutostartSource::AutostartSource(
+        std::shared_ptr<IEventQueue> queue,
+        AutostartMonitorConfig config
+    )
+        : ThreadedSource(std::move(queue)),
+          monitor_(std::make_unique<AutostartMonitor>(std::move(config))) {
+        std::cout << "AutostartSource: constructed with custom config\n";
+    }
+
     AutostartSource::~AutostartSource() {
         Stop();
     }
