@@ -33,7 +33,8 @@ int main() {
         ".custom-wants",
         ".custom-requires"
     };
-    monitoring::AutostartSource source(queue, std::move(config));
+    monitoring::AutostartSource source(queue);
+    source.SetMonitorConfig(config);
 
     const int rc = source.Start();
     if (rc != 0) {
@@ -66,6 +67,8 @@ int main() {
     }
 
     std::cerr << "main: stopping source and queue\n";
+
+    source.SetMonitorConfig(config);  // ERROR
 
     source.Stop();
     queue->Shutdown();

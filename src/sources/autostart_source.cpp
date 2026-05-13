@@ -28,6 +28,18 @@ namespace monitoring {
         std::cout << "AutostartSource: constructed with custom config\n";
     }
 
+    void AutostartSource::SetMonitorConfig(const AutostartMonitorConfig& config) {
+        if (is_running_.load()) {
+            std::cerr << "AutostartSource: cannot set config while running\n";
+            return;
+        }
+        monitor_->SetConfig(config);
+    }
+
+    AutostartMonitorConfig AutostartSource::GetMonitorConfig() const {
+        return monitor_->GetConfig();
+    }
+
     AutostartSource::~AutostartSource() {
         Stop();
     }
@@ -39,7 +51,7 @@ namespace monitoring {
         }
 
         while (is_running_.load()) {
-            std::vector<AutostartRawChange> raw_changes;
+            std::vector<AutostartRawEvent> raw_changes;
             monitor_->PollOnce(raw_changes, kPollingTimeoutMs);
 
             for (auto& change : raw_changes) {

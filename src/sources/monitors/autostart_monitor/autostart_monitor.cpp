@@ -33,13 +33,13 @@ constexpr uint64_t kAutostartMarkMask =
     FAN_EVENT_ON_CHILD |
     FAN_ONDIR;
 
-bool IsInterestingChange(uint64_t mask) {
+bool IsMonitoredEventOccured(uint64_t mask) {
     return (mask & kAutostartActionMask) != 0;
 }
 
 bool HasSuffix(const std::string& value, const std::string& suffix) {
     return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 std::string NormalizeDirPath(std::string path) {
@@ -142,7 +142,7 @@ std::optional<std::string> ReadFdPath(int fd) {
     return std::string(path);
 }
 
-std::string JoinDirAndFilePath(const std::string& dir, const std::string& name) {
+std::string JoinPath(const std::string& dir, const std::string& name) {
     if (!dir.empty() && dir.back() == '/') {
         return dir + name;
     }
@@ -188,9 +188,7 @@ EventType GetAutostartEventType(uint64_t mask) {
     return EventType::Unknown;
 }
 
-std::vector<std::string> CollectDependencyDirs(
-    const AutostartMonitorConfig& config
-) {
+std::vector<std::string> CollectDependencyDirs(const AutostartMonitorConfig& config) {
     std::vector<std::string> result;
 
     for (const auto& base_dir : config.base_dirs) {
@@ -333,7 +331,7 @@ bool AutostartMonitor::AddDependencyDirSuffix(std::string suffix) {
     return true;
 }
 
-const AutostartMonitorConfig& AutostartMonitor::GetConfig() const {
+AutostartMonitorConfig AutostartMonitor::GetConfig() const {
     return config_;
 }
 
@@ -562,21 +560,15 @@ std::optional<std::string> AutostartMonitor::ResolvePathFromDfidName(
     }
 
     const auto* handle = reinterpret_cast<const file_handle*>(fid->handle);
-
     const char* record_begin = reinterpret_cast<const char*>(fid);
     const char* record_end = record_begin + fid->hdr.len;
-
-    const char* name_begin =
-        reinterpret_cast<const char*>(handle->f_handle) +
-        handle->handle_bytes;
+    const char* name_begin = reinterpret_cast<const char*>(handle->f_handle) + handle->handle_bytes;
 
     if (name_begin >= record_end) {
         return std::nullopt;
     }
 
-    const std::size_t max_name_len =
-        static_cast<std::size_t>(record_end - name_begin);
-
+    const std::size_t max_name_len = static_cast<std::size_t>(record_end - name_begin);
     const std::size_t name_len = strnlen(name_begin, max_name_len);
 
     if (name_len == max_name_len) {
@@ -621,14 +613,14 @@ std::optional<std::string> AutostartMonitor::ResolvePathFromDfidName(
             continue;
         }
 
-        return JoinDirAndFilePath(*parent_path, name);
+        return JoinPath(parent_path.value(), name);
     }
 
     return std::nullopt;
 }
 
 void AutostartMonitor::PollOnce(
-    std::vector<AutostartRawChange>& changes,
+    std::vector<AutostartRawEvent>& changes,
     int timeout_ms
 ) {
     if (fan_fd_ < 0) {
@@ -702,7 +694,7 @@ void AutostartMonitor::PollOnce(
                 continue;
             }
 
-            if (!IsInterestingChange(metadata->mask)) {
+            if (!IsMonitoredEventOccured(metadata->mask)) {
                 metadata = FAN_EVENT_NEXT(metadata, remain);
                 continue;
             }
@@ -714,15 +706,11 @@ void AutostartMonitor::PollOnce(
                 continue;
             }
 
-            const char* info_ptr =
-                reinterpret_cast<const char*>(metadata) + metadata->metadata_len;
-
-            const char* event_end =
-                reinterpret_cast<const char*>(metadata) + metadata->event_len;
+            const char* info_ptr = reinterpret_cast<const char*>(metadata) + metadata->metadata_len;
+            const char* event_end = reinterpret_cast<const char*>(metadata) + metadata->event_len;
 
             while (info_ptr + sizeof(fanotify_event_info_header) <= event_end) {
-                const auto* hdr =
-                    reinterpret_cast<const fanotify_event_info_header*>(info_ptr);
+                const auto* hdr = reinterpret_cast<const fanotify_event_info_header*>(info_ptr);
 
                 if (hdr->len < sizeof(fanotify_event_info_header) ||
                     info_ptr + hdr->len > event_end) {
@@ -730,8 +718,7 @@ void AutostartMonitor::PollOnce(
                 }
 
                 if (hdr->info_type == FAN_EVENT_INFO_TYPE_DFID_NAME) {
-                    const auto* fid =
-                        reinterpret_cast<const fanotify_event_info_fid*>(info_ptr);
+                    const auto* fid = reinterpret_cast<const fanotify_event_info_fid*>(info_ptr);
 
                     auto path = ResolvePathFromDfidName(fid);
 
@@ -749,12 +736,12 @@ void AutostartMonitor::PollOnce(
                         std::cout << "autostart directory event: mask=0x"
                               << std::hex << metadata->mask
                               << std::dec
-                              << " path=" << *path
+                              << " path=" << path.value()
                               << std::endl;
                         if (IsDirectChildOfBaseRoot(path.value()) &&
                             IsDependencyDirectory(path.value())) {
                             std::cout << "autostart dependency dir changed, refreshing watches: "
-                                  << *path
+                                  << path.value()
                                   << std::endl;
                             RefreshWatches();
                             }
@@ -769,7 +756,7 @@ void AutostartMonitor::PollOnce(
                      * /etc/systemd/system/*.requires/
                      */
                     if (IsUnderWatchedDependencyRoot(path.value())) {
-                        AutostartRawChange change;
+                        AutostartRawEvent change;
                         change.path = std::move(path.value());
                         change.pid = metadata->pid;
                         change.ppid = GetParentPid(metadata->pid);
